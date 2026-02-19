@@ -1,5 +1,5 @@
 "use client";
-import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import Editor from "@monaco-editor/react";
 import { Tldraw, useEditor } from "tldraw";
 import "tldraw/tldraw.css";
@@ -12,7 +12,6 @@ import {
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { debounce } from "lodash";
-import JSZip from "jszip"; 
 
 // --- CONFIG ---
 const supabase = createClient(
@@ -23,7 +22,6 @@ const supabase = createClient(
 const AI_PROVIDERS = [
   { id: "openai", name: "ChatGPT (GPT-4o)" },
   { id: "gemini", name: "Google Gemini 1.5" },
-  { id: "nvidia", name: "NVIDIA NIM" },
   { id: "groq",   name: "Groq (Llama 3)" },
 ];
 
@@ -37,20 +35,25 @@ const PERMISSION_INFO: any = {
 type File = { id: string; path: string; content: string; language: string; locked_by: string | null; };
 type Member = { id: string; email: string; role: string; is_owner?: boolean; };
 
-// --- REAL-TIME WHITEBOARD SYNC HELPER ---
+// --- REAL-TIME WHITEBOARD SYNC (WEBSOCKETS) ---
 function WhiteboardSync({ roomId }: { roomId: string }) {
   const editor = useEditor();
   const isRemoteUpdate = useRef(false);
 
   useEffect(() => {
     if (!editor) return;
+    
+    // 1. Broadcast Local Drawing Strokes instantly
     const cleanup = editor.store.listen((update) => {
       if (isRemoteUpdate.current) return;
       if (update.source === 'user') {
-        supabase.channel(`room-${roomId}-board`).send({ type: 'broadcast', event: 'board-change', payload: update.changes });
+        supabase.channel(`room-${roomId}-board`).send({ 
+          type: 'broadcast', event: 'board-change', payload: update.changes 
+        });
       }
     }, { scope: 'document' });
 
+    // 2. Receive Remote Drawing Strokes instantly
     const channel = supabase.channel(`room-${roomId}-board`)
       .on('broadcast', { event: 'board-change' }, ({ payload }) => {
         isRemoteUpdate.current = true;
@@ -89,19 +92,22 @@ export default function Workspace({ roomId }: { roomId: string }) {
   const [currentUser, setCurrentUser] = useState<any>(null);
   const [myRole, setMyRole] = useState("Viewer");
   
+  // Invite State
   const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState("Frontend"); // Default role selection
   const [isInviting, setIsInviting] = useState(false);
   
+  // AI State
   const [provider, setProvider] = useState("openai");
   const [apiKey, setApiKey] = useState("");
   const [prompt, setPrompt] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [aiOutput, setAiOutput] = useState("AI Ready.");
-  
   const [aiMessage, setAiMessage] = useState("Welcome to Vibecoding! Run the Architect to see AI summaries here.");
   const [globalMode, setGlobalMode] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState("Connecting...");
   
+  // Environment State
+  const [connectionStatus, setConnectionStatus] = useState("Connecting...");
   const [terminalLogs, setTerminalLogs] = useState<string[]>(["> System Ready..."]);
   const [previewUrl, setPreviewUrl] = useState<string>(""); 
   const [isRunning, setIsRunning] = useState(false);
@@ -111,7 +117,7 @@ export default function Workspace({ roomId }: { roomId: string }) {
   const pyodideRef = useRef<any>(null);
   const editorRef = useRef<any>(null);
 
-  // --- INITIALIZATION ---
+  // --- INITIALIZATION & WEBSOCKET SETUP ---
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
       setCurrentUser(data.user);
@@ -124,11 +130,18 @@ export default function Workspace({ roomId }: { roomId: string }) {
     fetchFiles();
     loadPyodide();
 
+    // Setup Code & Lock Sync Channels
     const channel = supabase.channel(`room-${roomId}-code`)
+      // 1. Instant Typing Sync
       .on('broadcast', { event: 'code-update' }, ({ payload }) => {
         if (activeFileId === payload.fileId && isTypingRef.current) return;
         setFiles(prev => prev.map(f => f.id === payload.fileId ? { ...f, content: payload.content } : f));
       })
+      // 2. Instant File Lock Sync
+      .on('broadcast', { event: 'lock-update' }, ({ payload }) => {
+        setFiles(prev => prev.map(f => f.id === payload.fileId ? { ...f, locked_by: payload.locked_by } : f));
+      })
+      // 3. Database Fallback Sync
       .on('postgres_changes', { event: '*', schema: 'public', table: 'files', filter: `project_id=eq.${roomId}` }, (payload) => {
         if (payload.eventType === "UPDATE") {
            setFiles(prev => prev.map(f => {
@@ -223,7 +236,7 @@ export default function Workspace({ roomId }: { roomId: string }) {
     }
   };
 
-  const handleEditorDidMount = (editor: any, monaco: any) => {
+  const handleEditorDidMount = (editor: any) => {
     editorRef.current = editor;
   };
 
@@ -240,8 +253,11 @@ export default function Workspace({ roomId }: { roomId: string }) {
 
     isTypingRef.current = true;
     setFiles(prev => prev.map(f => f.id === activeFileId ? { ...f, content: newContent } : f));
+    
+    // Broadcast typing instantly
     supabase.channel(`room-${roomId}-code`).send({ type: 'broadcast', event: 'code-update', payload: { fileId: activeFileId, content: newContent } });
     
+    // Debounce save to DB
     const save = debounce(async () => {
        await supabase.from("files").update({ content: newContent }).eq("id", activeFileId);
        isTypingRef.current = false;
@@ -252,8 +268,19 @@ export default function Workspace({ roomId }: { roomId: string }) {
   const toggleLock = async (file: File) => {
     const isLocked = !!file.locked_by;
     if (isLocked && file.locked_by !== currentUser?.id && myRole !== "Leader") return alert("Unauthorized.");
-    setFiles(prev => prev.map(f => f.id === file.id ? { ...f, locked_by: isLocked ? null : currentUser?.id } : f));
-    await supabase.from("files").update({ locked_by: isLocked ? null : currentUser?.id }).eq("id", file.id);
+    
+    const newLockOwner = isLocked ? null : currentUser?.id;
+
+    // 1. Optimistic UI update locally
+    setFiles(prev => prev.map(f => f.id === file.id ? { ...f, locked_by: newLockOwner } : f));
+    
+    // 2. Broadcast instantly to other clients via WebSockets
+    supabase.channel(`room-${roomId}-code`).send({ 
+      type: 'broadcast', event: 'lock-update', payload: { fileId: file.id, locked_by: newLockOwner } 
+    });
+
+    // 3. Save persistently to Database
+    await supabase.from("files").update({ locked_by: newLockOwner }).eq("id", file.id);
   };
 
   const handleUpdateRole = async (memberId: string, newRole: string) => {
@@ -426,7 +453,6 @@ __builtins__.input = input
       setPrompt("");
       setGlobalMode(false);
       
-      // Auto-format after AI finishes
       setTimeout(() => {
         handleFormatCode();
         fetchFiles();
@@ -442,8 +468,14 @@ __builtins__.input = input
     if (!inviteEmail) return;
     setIsInviting(true);
     try {
-      await fetch("/api/invite", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: inviteEmail, projectId: roomId, role: "Viewer", url: window.location.href }) });
-      alert("Invite Sent!"); setShowTeamModal(false); setInviteEmail("");
+      await fetch("/api/invite", { 
+        method: "POST", 
+        headers: { "Content-Type": "application/json" }, 
+        body: JSON.stringify({ email: inviteEmail, projectId: roomId, role: inviteRole, url: window.location.href }) 
+      });
+      alert("Invite Sent!"); 
+      setShowTeamModal(false); 
+      setInviteEmail("");
     } catch (e) { alert("Network Error"); }
     setIsInviting(false);
   };
@@ -628,6 +660,9 @@ __builtins__.input = input
                  <h3 className="text-xs font-bold text-gray-500 mb-2 uppercase">Invite New Member</h3>
                  <div className="flex gap-2">
                     <input className="flex-1 bg-gray-900 border border-gray-700 rounded p-2 text-sm text-white outline-none" placeholder="colleague@example.com" value={inviteEmail} onChange={e => setInviteEmail(e.target.value)} />
+                    <select value={inviteRole} onChange={e => setInviteRole(e.target.value)} className="bg-gray-800 border border-gray-700 rounded p-2 text-sm text-white outline-none">
+                       {Object.keys(PERMISSION_INFO).map(r => <option key={r} value={r}>{r}</option>)}
+                    </select>
                     <button onClick={handleInvite} disabled={isInviting} className="bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold px-4 rounded">{isInviting ? "..." : "Send Invite"}</button>
                  </div>
               </div>
